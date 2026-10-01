@@ -1,0 +1,93 @@
+# `docker compose up --build` brings up: PostgreSQL -> MLflow server -> one-shot trainer -> FastAPI
+name: fraud-detection
+
+services:
+  db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-mlflow_db}
+      POSTGRES_USER: ${POSTGRES_USER:-mlflow_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-mlflow_password}
+    volumes:
+      - db_data:/var/lib/postgresql/data          # persistent MLflow backend store
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks: [mlops]
+
+  mlflow:
+    build:
+      context: .
+      dockerfile: docker/mlflow.Dockerfile
+    command: >
+      mlflow server
+      --host 0.0.0.0 --port 5000
+      --backend-store-uri ${DATABASE_URL:-postgresql://mlflow_user:mlflow_password@db:5432/mlflow_db}
+      --artifacts-destination /mlartifacts
+      --serve-artifacts
+    ports:
+      - "${MLFLOW_PORT:-5000}:5000"                # MLflow UI -> http://localhost:5000
+    volumes:
+      - mlflow_artifacts:/mlartifacts              # persistent artifact store
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    networks: [mlops]
+
+  # One-shot job: generates data, trains, logs and registers the model (skips if already registered).
+  trainer:
+    build: .
+    image: fraud-detection-api:latest
+    command: ["python", "train_model.py", "--skip-if-registered"]
+    environment:
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      MODEL_NAME: ${MODEL_NAME:-FraudDetectionModel}
+    depends_on:
+      mlflow:
+        condition: service_healthy
+    restart: "no"
+    networks: [mlops]
+
+  fraud-api:
+    build: .
+    image: fraud-detection-api:latest
+    ports:
+      - "${API_PORT:-8000}:8000"                   # API -> http://localhost:8000
+      - "8888:8000"                                # alias -> http://localhost:8888
+    environment:
+      APP_NAME: ${APP_NAME:-Fraud Detection API}
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      WEB_CONCURRENCY: ${WEB_CONCURRENCY:-2}
+      FRAUD_THRESHOLD: ${FRAUD_THRESHOLD:-0.5}
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      MODEL_NAME: ${MODEL_NAME:-FraudDetectionModel}
+      MODEL_VERSION: ${MODEL_VERSION:-1}
+    depends_on:
+      mlflow:
+        condition: service_healthy
+      trainer:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/api/v1/health', timeout=3).status == 200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+    networks: [mlops]
+
+networks:
+  mlops:
+
+volumes:
+  db_data:
+  mlflow_artifacts:
